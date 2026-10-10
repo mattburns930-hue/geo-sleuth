@@ -5,7 +5,7 @@
 # ///
 """Google Street View (the main source outside China): find points, see dates and nearby points, render by heading, build comparison sheets. Usage mirrors baidu_pano.py.
 
-Uses the endpoints the Google Maps web page itself calls; no key needed.
+Uses the endpoints the Google Maps web page itself calls; no key needed (lookup code: _streetview.py).
 There is almost no Google Street View coverage in mainland China; for photos from mainland China use baidu_pano.py.
 
 Examples:
@@ -18,7 +18,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
-from _net import curl_args, PROXY_HELP
+from _net import curl_args, is_image_file, PROXY_HELP
+from _streetview import THUMB, UA, near, parse_meta  # noqa: F401  (parse_meta re-exported for tests)
 import json
 import os
 import re
@@ -33,14 +34,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 import geo  # noqa: E402
 from baidu_pano import _font  # noqa: E402
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
-# official Street View car coverage only (user-uploaded panorama photos have ids like CIHM0og…, and the perspective endpoint can't render them)
-META = ("https://maps.googleapis.com/maps/api/js/GeoPhotoService.SingleImageSearch?pb=!1m5!1sapiv3!5sUS!11m2!1m1!1b0"
-        "!2m4!1m2!3d{lat}!4d{lon}!2d{radius}!3m10!2m2!1sen!2sUS!9m1!1e2!11m4!1m3!1e2!2b1!3e2"
-        "!4m6!1e1!1e2!1e3!1e4!1e8!1e6&callback=cb")
-THUMB = ("https://streetviewpixels-pa.googleapis.com/v1/thumbnail?panoid={id}&cb_client=maps_sv.tactile"
-         "&w={w}&h={h}&yaw={yaw:.1f}&pitch={pitch:.1f}&thumbfov={fov:.0f}")
-
 
 def _curl(url: str, proxy: str | None, out: Path | None = None) -> bytes:
     cmd = ["curl", "-q", "-s", "-m", "40", "-A", UA]
@@ -49,58 +42,6 @@ def _curl(url: str, proxy: str | None, out: Path | None = None) -> bytes:
         cmd += ["-o", str(out)]
     r = subprocess.run(cmd + [url], capture_output=True)
     return r.stdout
-
-
-def near(lat: float, lon: float, radius: float, proxy: str | None) -> dict | None:
-    t = _curl(META.format(lat=lat, lon=lon, radius=radius), proxy).decode("utf-8", "replace")
-    m = re.search(r"cb\(\s*(.*)\s*\)\s*;?\s*$", t, re.S)
-    if not m:
-        return None
-    try:
-        d = json.loads(m.group(1))
-        body = d[1]
-    except (json.JSONDecodeError, IndexError, TypeError):
-        return None
-    out: dict = {}
-    try:
-        out["id"] = body[1][1]
-        loc = body[5][0][1]
-        out["wgs"] = [loc[0][2], loc[0][3]]
-        out["pano_heading"] = round(loc[2][0], 1) if loc[2] else None
-    except (IndexError, TypeError):
-        return None
-    try:
-        out["address"] = " / ".join(x[0] for x in body[3][2])
-    except (IndexError, TypeError):
-        out["address"] = ""
-    # this panorama's capture date is in body[6][7]; body[5][0][8] holds historical captures [neighbor index, [year, month(, day)]], don't take it as this panorama's date
-    try:
-        out["date"] = _ym(body[6][7])
-    except (IndexError, TypeError):
-        out["date"] = None
-    nbrs = []
-    try:
-        for e in body[5][0][3][0]:
-            nbrs.append({"id": e[0][1], "wgs": [e[2][0][2], e[2][0][3]]})
-    except (IndexError, TypeError):
-        pass
-    hist = []
-    try:
-        for idx, ym, *_ in body[5][0][8] or []:
-            # user-uploaded panoramas get mixed into historical captures (perspective renders come out gray): ids start with CIHM0og/CIAB/CAoS, length varies from 22 to 28
-            pid = nbrs[idx]["id"] if idx < len(nbrs) else ""
-            if len(pid) == 22 and not pid.startswith(("CIHM", "CIAB", "CAoS")):
-                hist.append({**nbrs[idx], "date": _ym(ym)})
-    except (IndexError, TypeError, ValueError):
-        pass
-    out["history"] = sorted(hist, key=lambda h: h["date"], reverse=True)
-    out["dates_seen"] = sorted({d for d in [out["date"], *(h["date"] for h in hist)] if d})
-    out["neighbors"] = nbrs[:40]
-    return out
-
-
-def _ym(v: list) -> str:
-    return f"{v[0]}-{int(v[1]):02d}"
 
 
 def pick_date(res: dict, date: str) -> dict | None:
@@ -116,11 +57,14 @@ def render(pid: str, heading: float, pitch: float, fov: float, w: int, h: int, p
     """heading: compass bearing; positive pitch = looking up; fov: horizontal field of view."""
     cache.mkdir(parents=True, exist_ok=True)
     p = cache / f"{pid}_{heading:.0f}_{pitch:.0f}_{fov:.0f}_{w}x{h}.jpg"
-    if not (p.exists() and p.stat().st_size > 2000):
+    if not is_image_file(p):
+        p.unlink(missing_ok=True)
         _curl(THUMB.format(id=pid, w=w, h=h, yaw=heading % 360, pitch=-pitch, fov=fov), proxy, p)
     try:
         return Image.open(p).convert("RGB")
     except Exception:  # noqa: BLE001
+        p.unlink(missing_ok=True)  # never keep an error body under an image name
+        print(f"warning: Street View render failed for {pid} (heading {heading:.0f})", file=sys.stderr)
         return Image.new("RGB", (w, h), "gray")
 
 

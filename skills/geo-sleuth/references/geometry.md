@@ -1,6 +1,6 @@
 # Camera geometry: recovering bearing, distance and height from the frame
 
-Scripts: `scripts/geo.py` (`range` / `bearing` / `dest` / `fov` / `line` / `intersect` / `frame`), `scripts/pose.py` (solving the camera position from multiple points, scoring candidate camera positions), `scripts/terrain.py` (skyline rendering).
+Scripts: `scripts/geo.py` (`range` / `bearing` / `dest` / `fov` / `line` / `intersect` / `frame` / `fitcam`), `scripts/pose.py` (solving the camera position from multiple points, scoring candidate camera positions), `scripts/terrain.py` (skyline rendering).
 All results are estimates. When you write a conclusion, write out the assumptions you used (lens zoom, object size) with it.
 
 ## 1. Determine the field of view first
@@ -30,6 +30,7 @@ By default, estimate phone photos as taken with the main camera, 35mm-equivalent
 | 5x | ≈14–16° | ≈8–9° |
 
 When you can't tell the zoom, don't guess a single value: `geo.py range --real <object size> --pixels <pixels> --image-width <width> --hfov 8:70` gives the whole distance range; search for candidates over that range. Then use section 11 to check whether "landmark X is not in the frame" can exclude anything.
+**Fit the lens instead of assuming it** (section 12): `geo.py fitcam` scores every phone lens from 0.5x to 5x at once. Most photos are 1x, so 1x is the working assumption, but a geometry check run at one lens only tests that lens.
 The zoom can be backed out: identify two or more landmarks with known positions; the angle spanned by their horizontal pixel spacing in the frame can be computed from the candidate camera position; comparing the two gives the focal length (with 4 or more points, use `pose.py` from section 10 directly, with hfov not fixed).
 
 Focal length (pixels): `f = (image width in px / 2) / tan(FOV / 2)`
@@ -280,9 +281,28 @@ uv run scripts/tiles.py mark area.jpg --points ring_keep.json --geojson ... --ou
 - **Only a landmark that is "in frame over the whole field-of-view range, large enough and not blocked" can exclude this camera position by its absence**. Nearby buildings the script doesn't know about also occlude; a direction with tall buildings in the foreground still can't be excluded.
 - Look up the landmarks' h and w or measure them on satellite imagery; h and `--cam-h` use the same datum.
 
+## 12. Bearing fit with the lens unknown (geo.py fitcam)
+
+When you have the photo columns of three or more identified map points but no skyline, fit the camera instead of hand-checking one layout at one lens:
+
+```bash
+uv run scripts/geo.py fitcam --width 1200 --height 1600 --center <lat,lon> --radius 150 --grid 3 \
+    --feat corner:760:<lat,lon> --feat pediment:870:<lat,lon>|<lat,lon> --feat road_end:1150:<lat,lon> \
+    --feat left_end:20:<lat,lon> --feat lamp:420:<lat,lon> --out fit.json
+```
+
+- Every lens in `PHONE_LENSES` (0.5x, 1x 24/26 mm, 2x, 3x, 5x) is scored; focal length in pixels follows the image's aspect ratio (a 4:3 frame cropped to the image), so 9:16 stories and 16:9 crops are handled. Heading is solved at every grid position.
+- The score is the **pixel** RMS of the column residuals. Scoring in degrees favours telephoto lenses, because every angle shrinks as the focal length grows: in a test, a degree score picked 5x with the camera 98 m from the truth.
+- `a|b` gives a feature alternative map identities; the fit picks the best one per position and reports which. Use it whenever you aren't sure which building is which: a wrong identity was the root failure in the Queen's Parade case.
+- **Use ≥5 features spread across the frame and at different distances.** With 3–4, a distant camera with a long lens can fit by trading position against focal length. In synthetic tests with 5 well-spread features and 4 px noise, the true lens and position (0 m error) were recovered for 1x, 0.5x and 2x.
+- `band_m` is how far positions within 10 px of the best spread: the fit fixes a band along the sight lines, not a point.
+- The lens verdict keeps 1x unless another lens fits clearly better (rms more than 1.5× lower). When it is close, the lens is unresolved: keep the camera positions from both lenses as candidates.
+- Record the dependency: `board.py evidence … --assumes lens=1x`. If the lens later changes, `board.py assume lens=0.5x --reopen` re-opens what was rejected under 1x (hard rule 11).
+
 ## Common sources of error
 
 - Computing a 2x or 3x photo as 1x underestimates distance by half to two-thirds.
+- Rejecting a layout with a bearing check run at a single lens, then never re-testing it when the lens turns out different (Queen's Parade, Bath: the correct corner was tested first, rejected at 1x, and the photo was 0.5x). Fit the lens (section 12) and record `--assumes lens=…`.
 - On satellite imagery the roof of a tall building is offset from its base, so you measure the wrong point.
 - When shooting through window glass, reflections and window frames are easily taken as scene content.
 - Declaring building level with only one alignment line (v006); reporting meter-level precision from the skyline outline alone (v010-1).

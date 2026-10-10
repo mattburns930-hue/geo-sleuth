@@ -14,7 +14,7 @@
 | `osm.py` | Overpass: find / near (co-occurrence) / crossings (line-to-point) / route (route corridor) / intersect (crossings of two kinds of lines; bends are only labeled, `--rank-near` ranks) / street-scan (street-view geometry template) / geom (export geometry) |
 | `tiles.py` | Satellite tile mosaic, `mark` plots points + overlays GeoJSON lines + field-of-view wedge, `sheet` numbered thumbnails of candidate points |
 | `baidu_pano.py` | Baidu panoramas: near / info / scan / render / sheet (`--headings` to look around from one point, `--road` `--spread`) / sample (street view sampling of candidate cities) |
-| `gsv.py` | Google Street View (outside China): near / render / sheet, no key, official coverage only |
+| `gsv.py` | Google Street View (outside China): near / render / sheet, no key, official coverage only. Lookup lives in `_streetview.py` (the Maps JS `MapsJsInternalService/SingleImageSearch` RPC; the old JSONP `GeoPhotoService.SingleImageSearch` endpoint was turned down). If lookups return nothing everywhere, run `doctor.py --network`: it does a real lookup and fails when the endpoint changes |
 | `pose.py` | Solve camera position from multiple points: lat/lon, height, heading, pitch, roll, field of view + error radius + per-point check; `check` scores discrete candidate camera positions; `project` projects map points back onto the photo |
 | `terrain.py` | Elevation: view (synthesized mountain view; `--overlay` overlays the skyline on the photo, `--roll`) / profile (skyline) / elev / `ridge` reads ridgeline pixel points from the photo / `scan` filters a whole region along infrastructure lines for "flat nearby + mountain present" points and clusters them / `fit` batch skyline scoring of candidate camera positions (optional infrastructure-distance constraint; outputs overlays of the top N) |
 | `evidence.py` | Evidence image: satellite image + camera-position wedge + comparison panels |
@@ -72,7 +72,7 @@ The endpoints are all at `https://mapsv0.bdimg.com/`, need no key, and must be a
 
 | Source | Use | Known issues |
 |---|---|---|
-| Google Street View | Street view outside China, with historical dates; `gsv.py` | Almost none in China; user-uploaded panoramas (ids like CIHM0og…) can't produce perspective views, and the script already filters them out |
+| Google Street View | Street view outside China, with historical dates; `gsv.py` (hosts: `maps.googleapis.com`, `streetviewpixels-pa.googleapis.com`) | Almost none in China; user-uploaded panoramas (ids like CIHM0og…) can't produce perspective views, and the script already filters them out |
 | Mapillary, KartaView | Crowdsourced street view, rural roads outside China | Almost none in China |
 | Tencent Street View | Backup in China | API not yet investigated |
 | Map POI photos, hotel/scenic-area photos online, tourist photos | Compare skylines and building shapes when there's no street view | Shooting angle can't be controlled |
@@ -131,3 +131,10 @@ The endpoints are all at `https://mapsv0.bdimg.com/`, need no key, and must be a
 | Historical daily weather (temperature, sun/rain) | Check "frozen", "sunny"; with a date, exclude overcast or rainy areas |
 | Historical weather-satellite cloud imagery | Exclude large cloud areas on that day (clearly effective only with typhoons and fronts) |
 | Flightradar24, FlightAware | Flight history by registration; the paid tier can download KML/CSV tracks |
+
+## Hosts the browser-based reverse search needs
+
+A blocked CDN host makes an upload page render empty, which used to be reported as "page redesigned". `revimg.py` and `doctor.py --network` now name the hosts that failed. Besides the engine hosts, allow:
+
+- Baidu: `graph.baidu.com`, `s1.bdstatic.com` (and other `*.bdstatic.com`), `mms-graph.cdn.bcebos.com`, `mms-static.cdn.bcebos.com` (`*.bcebos.com`), `wappass.baidu.com`
+- Yandex: `yandex.com`, `yastatic.net`, `avatars.mds.yandex.net`

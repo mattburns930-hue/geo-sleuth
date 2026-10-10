@@ -23,7 +23,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
-from _net import fetch_bytes, PROXY_HELP
+from _net import fetch_bytes, image_kind, is_image_file, PROXY_HELP
 import io
 import json
 import math
@@ -139,13 +139,17 @@ def render(pid: str, heading: float, pitch: float = 10, fov: float = 80,
     key = f"{pid}_{heading:.0f}_{pitch:.0f}_{fov:.0f}_{w}x{h}.jpg"
     if cache:
         cache.mkdir(parents=True, exist_ok=True)
-        if (cache / key).exists():
+        if is_image_file(cache / key):
             return Image.open(cache / key)
+        (cache / key).unlink(missing_ok=True)
     url = (f"{API}?qt=pr3d&fovy={fov:.0f}&quality=80&panoid={pid}&heading={heading:.1f}"
            f"&pitch={pitch:.1f}&width={w}&height={h}")
     try:
         data = _get(url, 40, proxy)
     except Exception:
+        return Image.new("RGB", (w, h), "gray")
+    if image_kind(data) is None:  # error page or block notice: never cache it under an image name
+        print(f"warning: Baidu panorama render failed for {pid}: {data[:80]!r}", file=sys.stderr)
         return Image.new("RGB", (w, h), "gray")
     if cache:
         (cache / key).write_bytes(data)

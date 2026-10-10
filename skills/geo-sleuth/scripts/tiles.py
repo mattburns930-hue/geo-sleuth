@@ -22,12 +22,12 @@ Examples:
 from __future__ import annotations
 
 import argparse
-from _net import curl_args, PROXY_HELP
+from _net import download_image, PROXY_HELP
 import json
 import os
 import re
-import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -42,13 +42,37 @@ SOURCES = {
 }
 
 
-def _get(url: str, path: Path, proxy: str | None) -> bool:
-    if path.exists() and path.stat().st_size > 1000:
-        return True
-    cmd = ["curl", "-q", "-s", "-m", "60", "-o", str(path), url]
-    cmd += curl_args(proxy)
-    subprocess.run(cmd, check=False)
-    return path.exists() and path.stat().st_size > 1000
+_REPORT_LOCK = threading.Lock()
+
+
+def _get(url: str, path: Path, proxy: str | None, report: dict | None = None) -> bool:
+    """Fetch one tile into the cache; failures are counted (with the first reason per host) in `report`. Thread-safe."""
+    ok, reason = download_image(url, path, proxy)
+    if not ok and report is not None:
+        with _REPORT_LOCK:
+            report["failed"] = report.get("failed", 0) + 1
+            report.setdefault("reasons", {}).setdefault(url.split("/")[2], reason)
+    return ok
+
+
+def _is_placeholder(img: Image.Image) -> bool:
+    """Esri answers out-of-coverage zooms with a flat grey 'Map data not yet available' tile, not an error."""
+    from PIL import ImageStat
+    st = ImageStat.Stat(img.convert("L"))
+    return st.stddev[0] < 8 and 185 <= st.mean[0] <= 220
+
+
+def _warn(report: dict, source: str, zoom: int, total: int) -> list[str]:
+    msgs = []
+    for host, reason in report.get("reasons", {}).items():
+        msgs.append(f"{report['failed']}/{total} tiles failed from {host}: {reason}. Check network access to that host "
+                    "(a proxy/allowlist block returns text, not tiles); failed tiles are not cached.")
+    if report.get("placeholder"):
+        msgs.append(f"{report['placeholder']}/{total} tiles are '{source}' placeholders (no imagery at z{zoom}); "
+                    "try --source google or a lower --zoom.")
+    for m in msgs:
+        print("warning: " + m, file=sys.stderr)
+    return msgs
 
 
 def fetch(center: tuple[float, float], zoom: int, radius: int, out: Path, source: str,
@@ -60,26 +84,36 @@ def fetch(center: tuple[float, float], zoom: int, radius: int, out: Path, source
     ys = range(cy - radius, cy + radius + 1)
     jobs = [(x, y) for x in xs for y in ys]
 
+    report: dict = {}
+
     def job(t):
         x, y = t
         p = cache / f"{source}_{zoom}_{x}_{y}.jpg"
-        ok = _get(SOURCES[source].format(x=x, y=y, z=zoom), p, proxy)
+        ok = _get(SOURCES[source].format(x=x, y=y, z=zoom), p, proxy, report)
         return t, p, ok
 
     img = Image.new("RGB", (256 * len(xs), 256 * len(ys)), "black")
-    failed = 0
     with ThreadPoolExecutor(16) as ex:
-        for (x, y), p, ok in ex.map(job, jobs):
-            if not ok:
-                failed += 1
-                continue
-            try:
-                img.paste(Image.open(p), ((x - xs[0]) * 256, (y - ys[0]) * 256))
-            except Exception:
-                failed += 1
+        results = list(ex.map(job, jobs))
+    for (x, y), p, ok in results:
+        if not ok:
+            continue
+        try:
+            tile = Image.open(p).convert("RGB")
+        except Exception:  # noqa: BLE001
+            report["failed"] = report.get("failed", 0) + 1
+            p.unlink(missing_ok=True)
+            continue
+        if _is_placeholder(tile):
+            report["placeholder"] = report.get("placeholder", 0) + 1
+        img.paste(tile, ((x - xs[0]) * 256, (y - ys[0]) * 256))
     img.save(out, quality=90)
+    warnings = _warn(report, source, zoom, len(jobs))
     meta = {"zoom": zoom, "origin_tile": [xs[0], ys[0]], "center": list(center), "source": source,
-            "size": list(img.size), "m_per_px": geo.meters_per_px(zoom, center[0]), "failed_tiles": failed}
+            "size": list(img.size), "m_per_px": geo.meters_per_px(zoom, center[0]),
+            "failed_tiles": report.get("failed", 0), "placeholder_tiles": report.get("placeholder", 0)}
+    if warnings:
+        meta["warnings"] = warnings
     out.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
 
@@ -191,6 +225,8 @@ def sheet(points: dict, zoom: int, size: int, cols: int, out: Path, source: str,
     items = list(points.items())
     per = cols * cols
     pages = []
+    report: dict = {}
+    seen: set[tuple[int, int]] = set()
     for pi in range(0, len(items), per):
         chunk = items[pi:pi + per]
         rows = (len(chunk) + cols - 1) // cols
@@ -203,11 +239,17 @@ def sheet(points: dict, zoom: int, size: int, cols: int, out: Path, source: str,
             for tx in range(int(x0 // 256), int((x0 + size) // 256) + 1):
                 for ty in range(int(y0 // 256), int((y0 + size) // 256) + 1):
                     p = cache / f"{source}_{zoom}_{tx}_{ty}.jpg"
-                    if _get(SOURCES[source].format(x=tx, y=ty, z=zoom), p, proxy):
+                    first = (tx, ty) not in seen
+                    seen.add((tx, ty))
+                    if _get(SOURCES[source].format(x=tx, y=ty, z=zoom), p, proxy, report if first else None):
                         try:
-                            tile.paste(Image.open(p), (int(tx * 256 - x0), int(ty * 256 - y0)))
+                            im = Image.open(p).convert("RGB")
                         except Exception:  # noqa: BLE001
-                            pass
+                            p.unlink(missing_ok=True)
+                            continue
+                        if first and _is_placeholder(im):
+                            report["placeholder"] = report.get("placeholder", 0) + 1
+                        tile.paste(im, (int(tx * 256 - x0), int(ty * 256 - y0)))
             cx, cy = (k % cols) * size, (k // cols) * size
             S.paste(tile, (cx, cy))
             c = size / 2
@@ -218,6 +260,7 @@ def sheet(points: dict, zoom: int, size: int, cols: int, out: Path, source: str,
         o = out if pi == 0 else out.with_name(f"{out.stem}_{pi // per + 1}{out.suffix}")
         S.save(o, quality=88)
         pages.append(o)
+    _warn(report, source, zoom, len(seen))
     return pages
 
 

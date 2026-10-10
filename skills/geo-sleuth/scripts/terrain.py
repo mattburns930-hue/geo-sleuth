@@ -36,12 +36,11 @@ For the fields of ridge.json and fit.json, see each subcommand's --help.
 from __future__ import annotations
 
 import argparse
-from _net import curl_args, PROXY_HELP
+from _net import download_image, PROXY_HELP
 import json
 import math
 import os
 import re
-import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -57,15 +56,24 @@ R_EARTH = 6371008.8
 K_REFRACTION = 0.13
 
 
+_FAILED_TILES: dict[str, str] = {}
+
+
 def _fetch(z: int, x: int, y: int, cache: Path, proxy: str | None) -> np.ndarray:
     p = cache / f"terrarium_{z}_{x}_{y}.png"
-    if not (p.exists() and p.stat().st_size > 100):
-        cmd = ["curl", "-q", "-s", "-m", "60", "-o", str(p), TILE.format(z=z, x=x, y=y)]
-        cmd += curl_args(proxy)
-        subprocess.run(cmd, check=False)
+    ok, reason = download_image(TILE.format(z=z, x=x, y=y), p, proxy)
     try:
-        a = np.asarray(Image.open(p).convert("RGB"), dtype=np.float32)
+        a = np.asarray(Image.open(p).convert("RGB"), dtype=np.float32) if ok else None
     except Exception:  # noqa: BLE001
+        p.unlink(missing_ok=True)
+        a, reason = None, "unreadable tile"
+    if a is None:
+        # a missing tile would read as flat ground at sea level and silently corrupt skylines: say so loudly
+        key = f"{z}/{x}/{y}"
+        if key not in _FAILED_TILES:
+            _FAILED_TILES[key] = reason
+            print(f"warning: elevation tile {key} unavailable ({reason}); treated as 0 m. "
+                  "Results near it are unreliable; check access to s3.amazonaws.com.", file=sys.stderr)
         return np.zeros((256, 256), dtype=np.float32)
     return a[..., 0] * 256 + a[..., 1] + a[..., 2] / 256 - 32768
 

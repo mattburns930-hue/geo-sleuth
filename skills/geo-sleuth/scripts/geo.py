@@ -254,6 +254,108 @@ def fov_from_equiv_focal(focal_mm: float, aspect: tuple[int, int] = (4, 3)) -> t
             math.degrees(2 * math.atan(short_side / 2 / focal_mm)))
 
 
+# Phone lenses as 35mm-equivalent focal lengths. Most phone photos are 1x; the lens is still unknown until fitted.
+PHONE_LENSES = [("0.5x", 13.0), ("1x", 24.0), ("1x-26mm", 26.0), ("2x", 48.0), ("3x", 77.0), ("5x", 120.0)]
+EQUIV_LONG_MM = 43.2666 * 4 / 5  # long side of the 4:3 frame with a 35mm-equivalent diagonal
+
+
+def lens_focal_px(focal_mm: float, width_px: float, height_px: float) -> float:
+    """35mm-equivalent focal length → horizontal focal length in pixels for this image.
+
+    Assumes a 4:3 sensor frame cropped to the image's aspect ratio: a wider-than-4:3 crop (16:9 landscape)
+    keeps the frame's long side, a narrower one (9:16 story, 1:1) keeps its short side. Screenshots scaled
+    down keep their proportions, so this holds for them too. e.g. 1200x1600 portrait: 1x(24mm) ≈ 1109 px, 0.5x ≈ 601 px.
+    """
+    long_px, short_px = max(width_px, height_px), min(width_px, height_px)
+    native_long = max(long_px, short_px * 4 / 3)
+    return focal_mm * native_long / EQUIV_LONG_MM
+
+
+def _wrap(a: float) -> float:
+    return (a + 180.0) % 360.0 - 180.0
+
+
+def fit_camera(feats: list[tuple[str, float, list[tuple[float, float]]]], width: float, height: float,
+               center: tuple[float, float], radius: float, grid: float,
+               lenses: list[tuple[str, float]] | None = None, cx: float | None = None,
+               min_dist: float = 3.0, band_px: float = 10.0) -> list[dict]:
+    """Fit camera position + heading from photo columns of known map points, for each candidate lens.
+
+    feats: (name, pixel column x, [(lat, lon), …alternative identities]). Heading is solved per position;
+    score = RMS of column residuals in pixels (comparable across lenses). With a free position, a wider lens can often be traded for a closer
+    camera, so several lenses may fit: the result reports all of them and never fixes the lens silently.
+    Returns one dict per lens, best first.
+    """
+    import itertools
+    if len(feats) < 3:
+        raise ValueError("need at least 3 features: with 2, position and heading can always be fitted exactly")
+    lenses = lenses or PHONE_LENSES
+    cx = width / 2 if cx is None else cx
+    combos = list(itertools.product(*[range(len(f[2])) for f in feats]))[:256]
+    cams = []
+    n = int(radius // grid)
+    for i in range(-n, n + 1):
+        for j in range(-n, n + 1):
+            if (i * grid) ** 2 + (j * grid) ** 2 <= radius ** 2:
+                cams.append(_ll((i * grid, j * grid), center))
+    out = []
+    for lname, mm in lenses:
+        f = lens_focal_px(mm, width, height)
+        offs = [math.degrees(math.atan((x - cx) / f)) for _, x, _ in feats]
+        best, near_best = None, []
+        for cam in cams:
+            brg = [[None if distance(cam, p) < min_dist else bearing(cam, p) for p in alts] for _, _, alts in feats]
+            for combo in combos:
+                bs = [brg[k][c] for k, c in enumerate(combo)]
+                if any(b is None for b in bs):
+                    continue
+                d = [math.radians(b - o) for b, o in zip(bs, offs)]
+                H = math.degrees(math.atan2(sum(math.sin(v) for v in d), sum(math.cos(v) for v in d))) % 360
+                # score in pixels, the unit the columns were measured in: degree residuals shrink with focal
+                # length and would always favour a far-away camera with a telephoto lens
+                res = []
+                for (_, x, _), b in zip(feats, bs):
+                    a = _wrap(b - H)
+                    res.append((cx + f * math.tan(math.radians(a)) - x) if abs(a) < 89 else 1e4)
+                rms = math.sqrt(sum(r * r for r in res) / len(res))
+                row = (rms, cam, H, res, combo)
+                if best is None or rms < best[0]:
+                    best = row
+                near_best.append((rms, cam))
+        if best is None:
+            continue
+        band = [c for r, c in near_best if r <= best[0] + band_px]
+        spread = max((distance(best[1], c) for c in band), default=0.0)
+        out.append({"lens": lname, "equiv_mm": mm, "focal_px": round(f, 1),
+                    "hfov_deg": round(2 * math.degrees(math.atan(width / 2 / f)), 1),
+                    "rms_px": round(best[0], 1), "cam": [round(best[1][0], 6), round(best[1][1], 6)],
+                    "heading": round(best[2], 1),
+                    "residuals": {feats[k][0]: round(r, 2) for k, r in enumerate(best[3])},
+                    "identities": {feats[k][0]: best[4][k] for k in range(len(feats)) if len(feats[k][2]) > 1},
+                    "band_m": round(spread), "band_n": len(band)})
+    out.sort(key=lambda r: r["rms_px"])
+    return out
+
+
+def lens_verdict(fits: list[dict], tie_ratio: float = 1.5) -> str:
+    """1x is the working assumption unless another lens fits clearly better."""
+    if not fits:
+        return "no fit"
+    best = fits[0]
+    one = next((r for r in fits if r["lens"].startswith("1x")), None)
+    if best["lens"].startswith("1x"):
+        others = [r for r in fits if not r["lens"].startswith("1x") and r["rms_px"] <= best["rms_px"] * tie_ratio]
+        if others:
+            return (f"1x fits best, but {others[0]['lens']} is close (rms {others[0]['rms_px']} px vs {best['rms_px']} px): "
+                    "lens unresolved; keep 1x as the working assumption and keep both camera positions as candidates")
+        return f"1x fits best (rms {best['rms_px']} px)"
+    if one and one["rms_px"] <= best["rms_px"] * tie_ratio:
+        return (f"{best['lens']} and 1x fit about equally (rms {best['rms_px']} px vs {one['rms_px']} px): lens unresolved; "
+                "most phone photos are 1x, so keep both camera positions as candidates")
+    return (f"{best['lens']} fits clearly better than 1x (rms {best['rms_px']} px vs {one['rms_px'] if one else '?'} px): "
+            f"record it with `board.py assume lens={best['lens']}` and re-check anything ruled out under lens=1x")
+
+
 # ---------------------------------------------------------------- sight-line intersection
 
 def _enu(p: tuple[float, float], o: tuple[float, float]) -> tuple[float, float]:
@@ -751,6 +853,25 @@ def main() -> None:
     ln.add_argument("--step", type=float, default=100)
     ln.add_argument("--out", help="write {name:[lat,lon]}, can be passed to tiles.py mark")
 
+    fc = sub.add_parser("fitcam", help="camera position + heading from photo columns of known map points, fitted for every phone lens (0.5x–5x); never assumes the lens",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        epilog="Example:\n"
+                               "  geo.py fitcam --width 1200 --height 1600 --center <lat,lon> --radius 150 --grid 3 \\\n"
+                               "    --feat corner:760:<lat,lon> --feat pediment:870:<lat,lon> --feat road_end:1150:<lat,lon> \\\n"
+                               "    --feat left_end:20:<lat,lon> --feat lamp:420:<lat,lon> --out fit.json\n"
+                               "Use ≥5 features spread across the frame and at different distances.\n"
+                               "Several identities for one feature: name:x:lat,lon|lat,lon (the fit picks the best).\n"
+                               "A wide lens can be traded for a closer camera, so read band_m and every lens row, not just the top one.")
+    fc.add_argument("--feat", action="append", required=True, help="name:pixel_x:lat,lon[|lat,lon…] (≥3)")
+    fc.add_argument("--width", type=float, required=True, help="image width px")
+    fc.add_argument("--height", type=float, required=True, help="image height px (orientation/aspect decide the focal length)")
+    fc.add_argument("--center", type=_pair, required=True, help="lat,lon of the search area")
+    fc.add_argument("--radius", type=float, default=150, help="search radius m")
+    fc.add_argument("--grid", type=float, default=5, help="grid step m")
+    fc.add_argument("--lenses", help="override, e.g. 0.5x:13,1x:24,2x:48 (default 0.5x,1x,1x-26mm,2x,3x,5x)")
+    fc.add_argument("--cx", type=float, help="principal point column (default image centre)")
+    fc.add_argument("--out", help="write the fits as JSON")
+
     it = sub.add_parser("intersect", help="intersect two sight lines (with error radius)")
     it.add_argument("--align1", help="near_lat,near_lon:far_lat,far_lon (first aligned pair)")
     it.add_argument("--align2", help="second aligned pair, same format")
@@ -931,7 +1052,7 @@ def main() -> None:
                 print(f"   {n}: {v['verdict']} → absence {'can' if v['absence_excludes'] else 'cannot'} exclude")
             if len(hfovs) == 1:
                 f0 = frames[0]
-                print(f"   heading {f0['heading']}°: " + "; ".join(
+                print(f"   heading {f0['heading']}px: " + "; ".join(
                     f"{r['name']} x={r['px']} {r['in_frame']}" + (f" height {r['height_px']}px" if "height_px" in r else "")
                     for r in f0["points"]))
             else:
@@ -1033,6 +1154,40 @@ def main() -> None:
         if args.out:
             with open(args.out, "w", encoding="utf-8") as fh:
                 json.dump(out, fh, ensure_ascii=False, indent=1)
+            print(f"-> {args.out}")
+    elif args.cmd == "fitcam":
+        feats = []
+        for spec in args.feat:
+            try:
+                name, x, alts = spec.split(":", 2)
+                feats.append((name, float(x), [_pair(a) for a in alts.split("|")]))
+            except ValueError:
+                ap.error(f"--feat {spec!r}: expected name:pixel_x:lat,lon[|lat,lon]")
+        lenses = None
+        if args.lenses:
+            lenses = [(a.split(":")[0], float(a.split(":")[1])) for a in args.lenses.split(",")]
+        try:
+            fits = fit_camera(feats, args.width, args.height, args.center, args.radius, args.grid, lenses, args.cx)
+        except ValueError as e:
+            ap.error(str(e))
+        print(f"{'lens':8s} {'f_px':>6s} {'hfov':>5s} {'rms px':>6s}  camera               heading  band")
+        for r in fits:
+            print(f"{r['lens']:8s} {r['focal_px']:6.0f} {r['hfov_deg']:5.1f} {r['rms_px']:6.1f}  "
+                  f"{r['cam'][0]:.6f},{r['cam'][1]:.6f} {r['heading']:6.1f}  {r['band_m']:4d} m")
+            print("         residuals px " + ", ".join(f"{k} {v:+.0f}" for k, v in r["residuals"].items())
+                  + ("; identities " + ", ".join(f"{k}=#{v}" for k, v in r["identities"].items()) if r["identities"] else ""))
+        verdict = lens_verdict(fits)
+        print("Lens: " + verdict)
+        if len(feats) < 5:
+            print(f"Warning: only {len(feats)} features. With 3–4, a distant camera with a long lens can fit by trading position "
+                  "for focal length; use ≥5 features spread across the frame and at different distances before trusting the lens.")
+        print("band = how far positions within 10 px of the best rms spread: the fit fixes a sight-line band, not a point; "
+              "add a second constraint (alignment, distance, street view) before claiming <100 m.")
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                json.dump({"features": [{"name": n, "x": x, "alternatives": a} for n, x, a in feats],
+                           "image": [args.width, args.height], "fits": fits, "lens_verdict": verdict,
+                           "assumes": {"lens": "fitted"}}, fh, ensure_ascii=False, indent=1)
             print(f"-> {args.out}")
     elif args.cmd == "fov":
         lf, sf = fov_from_equiv_focal(args.focal)

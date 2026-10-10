@@ -29,4 +29,4 @@ Open an issue with: your own photo (or a description if you would rather not pos
 
 ## Runtime checks
 
-Run `uv run skills/geo-sleuth/tests/test_runtime.py` for offline routing, browser fallback and diagnostics regressions. The test uses only loopback HTTP and mocked service calls; it does not upload photos or download ML models. Use `doctor.py --network` separately for live reachability.
+Run `uv run skills/geo-sleuth/tests/test_runtime.py` for offline routing, browser fallback and diagnostics regressions, and `uv run skills/geo-sleuth/tests/test_fixes.py` for Street View parsing, cache validation, lens fitting, board assumptions and upload diagnosis. Both use only loopback HTTP and mocked service calls; it does not upload photos or download ML models. Use `doctor.py --network` separately for live reachability.

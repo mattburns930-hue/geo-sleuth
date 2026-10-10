@@ -21,6 +21,7 @@ Rules are written as code, not left to self-discipline:
   clue       record a clue: seen / text read / inferred / computed
   evidence   a clue's likelihood ratio for some candidates (>1 supports, <1 opposes)
   exclude    exclude a candidate (needs a computed file)
+  assume     record/revise an assumption (lens=1x, camera height…); lists and with --reopen re-opens what was rejected under another value
   scan-bbox  set a candidate's scan extent (built-up area); pages are counted from it
   urban      fill scan-bbox automatically with gazetteer.py urban
   falsify    write the falsification condition before scanning/confirming
@@ -43,6 +44,8 @@ Examples:
   board.py next
   board.py falsify <district A> --text "give up if the sports field's long axis isn't north-south"
   board.py exclude <district B> --clue K4 --computed frame.json --why "by the view-angle range X should be in frame and ≥40px; it isn't in the image"
+  board.py evidence --clue K5 --against "NW corner":0.3 --assumes lens=1x --file fit.json   # geometry depends on the lens
+  board.py assume lens=0.5x --reopen                     # the lens changed: re-open what was rejected under lens=1x
   board.py check
   board.py report --merge result.json
 """
@@ -107,6 +110,25 @@ def _find(b: dict, name: str) -> str:
     sys.exit(f"\"{name}\" matches several candidates: {hits}; write the full name")
 
 
+def _parse_assumes(items: list[str] | None) -> dict:
+    out = {}
+    for it in items or []:
+        if "=" not in it:
+            sys.exit(f"--assumes {it!r}: expected key=value, e.g. lens=1x, camera_height=1.6, heading=sun")
+        k, v = it.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _live(b: dict) -> list[dict]:
+    """Evidence still in force (superseded entries were made under an assumption that was later revised)."""
+    return [e for e in b["evidence"] if not e.get("superseded_by")]
+
+
+def _conflicts(assumes: dict | None, key: str, value: str) -> bool:
+    return bool(assumes) and key in assumes and assumes[key] != value
+
+
 def _log(b: dict, text: str) -> None:
     b.setdefault("log", []).append(f"{datetime.now():%H:%M} {text}")
 
@@ -140,7 +162,7 @@ def _scores(b: dict, level: str, prior_by: str) -> list[dict]:
         if prior_by == "area" and c.get("bbox"):
             prior = max(_bbox_km2(c["bbox"]), 1.0)
         logit = math.log(prior) + math.log(max(c.get("prior", 1.0), 1e-9))
-        ev = [e for e in b["evidence"] if e["candidate"] == name]
+        ev = [e for e in _live(b) if e["candidate"] == name]
         for e in ev:
             logit += math.log(max(e["lr"], 1e-9))
         rows.append({"name": name, "logit": logit, "n_ev": len(ev),
@@ -377,6 +399,7 @@ def cmd_evidence(args, p: Path) -> None:
     cl = b["clues"][args.clue]
     cap = LR_CAP[cl["status"]]
     pairs = _parse_lr(args.for_, 3.0) + [(n, v) for n, v in _parse_lr(args.against, 1 / 3)]
+    assumes = _parse_assumes(args.assumes)
     if not pairs:
         sys.exit("Give at least one --for name:likelihood_ratio or --against name:likelihood_ratio")
     clipped = []
@@ -387,8 +410,11 @@ def cmd_evidence(args, p: Path) -> None:
         lr2 = min(max(lr, 1 / cap), cap)
         if abs(lr2 - lr) > 1e-9:
             clipped.append(f"{cname}:{lr:g}→{lr2:g}")
-        b["evidence"].append({"id": f"E{len(b['evidence']) + 1}", "clue": args.clue, "candidate": cname, "lr": lr2,
-                              "why": args.why or "", "file": args.file or "", "cmd": args.command_ or ""})
+        rec = {"id": f"E{len(b['evidence']) + 1}", "clue": args.clue, "candidate": cname, "lr": lr2,
+               "why": args.why or "", "file": args.file or "", "cmd": args.command_ or ""}
+        if assumes:
+            rec["assumes"] = assumes
+        b["evidence"].append(rec)
     cl["used"] = True
     if args.file and not Path(args.file).exists():
         print(f"Note: {args.file} doesn't exist; evidence files must be real outputs of this session")
@@ -432,10 +458,50 @@ def cmd_exclude(args, p: Path) -> None:
     c["status"] = "excluded"
     c["excluded_by"] = {"clue": args.clue, "computed": args.computed, "why": args.why or "",
                         "covers": args.covers or ""}
+    assumes = _parse_assumes(args.assumes)
+    if assumes:
+        c["excluded_by"]["assumes"] = assumes
     cl["used"] = True
     _log(b, f"exclude {cname} by {args.clue} ({args.computed})")
     _save(p, b)
     print(f"Excluded {cname}. Excluded candidates stay in the ledger; check looks back at them.")
+
+
+def cmd_assume(args, p: Path) -> None:
+    """Record or revise a camera/scene assumption; list (and with --reopen, undo) what was decided under a different value.
+
+    Evidence made under the old value is unreliable in both directions, so support is set aside along with rejections."""
+    b = _load(p)
+    key, value = next(iter(_parse_assumes([args.assumption]).items()))
+    prev = b.setdefault("assumptions", {}).get(key)
+    b["assumptions"][key] = {"value": value, "verified": args.verified, "file": args.file or "",
+                             "at": datetime.now().isoformat(timespec="seconds")}
+    ev = [e for e in _live(b) if _conflicts(e.get("assumes"), key, value)]  # support and rejection alike
+    ex = [(n, c) for n, c in b["candidates"].items()
+          if c.get("status") == "excluded" and _conflicts(c.get("excluded_by", {}).get("assumes"), key, value)]
+    was = f" (was {prev['value']})" if prev and prev["value"] != value else ""
+    print(f"Assumption {key}={value}{was}, {'verified' if args.verified else 'unverified'}.")
+    if not ev and not ex:
+        print("Nothing on the board was decided under a different value.")
+    for e in ev:
+        kind = "down-weighted" if e["lr"] < 1 else "supported"
+        print(f"  {kind} under {key}={e['assumes'][key]}: {e['candidate']} (lr {e['lr']:g}, {e['clue']}: {e['why'][:80]})")
+    for n, c in ex:
+        print(f"  excluded under {key}={c['excluded_by']['assumes'][key]}: {n} ({c['excluded_by'].get('why', '')[:80]})")
+    if (ev or ex) and args.reopen:
+        for e in ev:
+            e["superseded_by"] = f"{key}={value}"
+        for n, c in ex:
+            c.setdefault("exclusion_history", []).append({**c["excluded_by"], "reopened_by": f"{key}={value}"})
+            c["status"] = "open"
+            c.pop("excluded_by", None)
+        print(f"Re-opened {len(ex)} candidate(s) and set aside {len(ev)} piece(s) of evidence made under the old value. "
+              f"Re-run their geometry under {key}={value} and record fresh evidence (hard rule: re-test every rejected candidate, not just the favourite).")
+    elif ev or ex:
+        print(f"→ Re-run the geometry for each of these under {key}={value}, then `board.py assume {key}={value} --reopen` "
+              "(or record new evidence). Don't re-test only the current favourite.")
+    _log(b, f"assume {key}={value}{' verified' if args.verified else ''}{' reopen' if args.reopen else ''}")
+    _save(p, b)
 
 
 def cmd_scan_bbox(args, p: Path) -> None:
@@ -632,12 +698,27 @@ def cmd_check(args, p: Path) -> None:
             print(f"  WARN {len(unseen)}/{len(rows)} {LEVEL_LABEL[lv]} candidates have no evidence at all, i.e. were never looked at: "
                   f"{', '.join(unseen[:10])}{' …' if len(unseen) > 10 else ''} → look at each; record evidence --against even when it doesn't match; "
                   f"unseen ones don't count as excluded; state this in the conclusion")
-        down = [(e["candidate"], e["clue"]) for e in b["evidence"]
+        down = [(e["candidate"], e["clue"]) for e in _live(b)
                 if e["lr"] < 1 and b["clues"][e["clue"]]["status"] in ("inferred", "observed")
                 and b["candidates"][e["candidate"]].get("status") != "excluded"]
         if down:
             names = sorted({n for n, _ in down})
             print(f"  NOTE candidates down-weighted by inference but not excluded: {', '.join(names[:10])} → when no candidate matches, look back at these first")
+    assumptions = b.get("assumptions", {})
+    shaky = {}
+    for e in _live(b):
+        if e["lr"] < 1:
+            for k, v in (e.get("assumes") or {}).items():
+                if not assumptions.get(k, {}).get("verified") or assumptions[k]["value"] != v:
+                    shaky.setdefault(f"{k}={v}", set()).add(e["candidate"])
+    for n, c in b["candidates"].items():
+        if c.get("status") == "excluded":
+            for k, v in (c.get("excluded_by", {}).get("assumes") or {}).items():
+                if not assumptions.get(k, {}).get("verified") or assumptions[k]["value"] != v:
+                    shaky.setdefault(f"{k}={v}", set()).add(n)
+    for kv, names in shaky.items():
+        print(f"  WARN rejections that depend on the unverified assumption {kv}: {', '.join(sorted(names)[:10])} → "
+              f"verify it (`board.py assume {kv} --verified --file …`) or re-test them under the alternatives")
     for k, c in b["clues"].items():
         if c["status"] in ("read", "computed") and not c.get("file"):
             print(f"  WARN {k} is {c['status']} but has no file: text read needs a zoomed image, computed results need an output file")
@@ -654,7 +735,8 @@ def cmd_report(args, p: Path) -> None:
     b = _load(p)
     lv = _frontier(b)
     rep = {"candidate_levels": {}, "main": None, "alternatives": [], "excluded": [], "unused_clues": [],
-           "downweighted_not_excluded": [], "falsify": b["falsify"]}
+           "downweighted_not_excluded": [], "falsify": b["falsify"], "assumptions": b.get("assumptions", {}),
+           "reopened": [n for n, c in b["candidates"].items() if c.get("exclusion_history")]}
     for l2 in LEVELS:
         rows = _scores(b, l2, args.prior_by)
         if rows:
@@ -666,7 +748,7 @@ def cmd_report(args, p: Path) -> None:
         rep["main"] = {"level": lv, "name": top["name"], "share": round(top["share"], 3),
                        "evidence": [{"clue": b["clues"][e["clue"]]["text"], "status": b["clues"][e["clue"]]["status"],
                                      "lr": e["lr"], "why": e["why"], "file": e["file"]}
-                                    for e in b["evidence"] if e["candidate"] == top["name"]]}
+                                    for e in _live(b) if e["candidate"] == top["name"]]}
         for r in rows[1:]:
             if r["share"] >= 0.05:
                 rep["alternatives"].append({"name": r["name"], "share": round(r["share"], 3),
@@ -678,7 +760,7 @@ def cmd_report(args, p: Path) -> None:
             rep["excluded"].append({"name": name, "clue": b["clues"].get(ex.get("clue"), {}).get("text", ""),
                                     "computed": ex.get("computed"), "why": ex.get("why", "")})
     rep["unused_clues"] = [c["text"] for c in b["clues"].values() if not c["used"]]
-    rep["downweighted_not_excluded"] = sorted({e["candidate"] for e in b["evidence"] if e["lr"] < 1
+    rep["downweighted_not_excluded"] = sorted({e["candidate"] for e in _live(b) if e["lr"] < 1
                                                and b["clues"][e["clue"]]["status"] in ("inferred", "observed")
                                                and b["candidates"][e["candidate"]].get("status") != "excluded"})
     if args.merge:
@@ -814,6 +896,7 @@ def main() -> None:
     e.add_argument("--why")
     e.add_argument("--file")
     e.add_argument("--command", dest="command_", help="the command that produced this evidence")
+    e.add_argument("--assumes", action="append", help="key=value this evidence depends on (lens=1x, camera_height=1.6, …); repeatable")
 
     x = sub.add_parser("exclude")
     x.add_argument("name")
@@ -821,6 +904,13 @@ def main() -> None:
     x.add_argument("--computed", required=True, help="computed file (must exist)")
     x.add_argument("--covers", help="where the evidence actually covers: 'lat,lon' or 'lat,lon:lat,lon'; required for district/area/road candidates")
     x.add_argument("--why")
+    x.add_argument("--assumes", action="append", help="key=value the computation depended on (e.g. lens=1x); repeatable")
+
+    asm = sub.add_parser("assume", help="record/revise an assumption (lens, camera height…) and list or re-open what was rejected under a different value")
+    asm.add_argument("assumption", help="key=value, e.g. lens=0.5x")
+    asm.add_argument("--verified", action="store_true", help="the value is established (EXIF, a lens fit that clearly wins, the user said so)")
+    asm.add_argument("--file", help="file that establishes it (e.g. geo.py fitcam --out)")
+    asm.add_argument("--reopen", action="store_true", help="re-open candidates excluded, and set aside down-weightings made, under a conflicting value")
 
     sb = sub.add_parser("scan-bbox")
     sb.add_argument("name")
@@ -862,7 +952,7 @@ def main() -> None:
     args = ap.parse_args()
     p = args.board
     fn = {"init": cmd_init, "add": cmd_add, "children": cmd_children, "clue": cmd_clue, "evidence": cmd_evidence,
-          "exclude": cmd_exclude, "scan-bbox": cmd_scan_bbox, "urban": cmd_urban, "falsify": cmd_falsify,
+          "exclude": cmd_exclude, "assume": cmd_assume, "scan-bbox": cmd_scan_bbox, "urban": cmd_urban, "falsify": cmd_falsify,
           "rank": cmd_rank, "next": cmd_next, "check": cmd_check, "report": cmd_report, "apply": cmd_apply, "log": cmd_log}
     fn[args.cmd](args, p)
 

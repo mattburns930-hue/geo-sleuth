@@ -9,8 +9,10 @@
   uv run scripts/doctor.py --network         also probe public service endpoints
   uv run scripts/doctor.py --json            machine-readable results on stdout
 
-uv may install this script's Playwright dependency on first use. Network probes only
-check reachability, not image uploads, API stability, coverage, or model inference.
+uv may install this script's Playwright dependency on first use. Network probes mostly
+check reachability, not image uploads, API stability, coverage, or model inference;
+Street View does one real panorama lookup; Baidu/Yandex open their upload pages and look for the
+upload control (no image is uploaded).
 Exit codes: 0 = no failed checks (warnings may remain); 1 = at least one failed check.
 """
 from __future__ import annotations
@@ -27,15 +29,14 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from _browser import launch_browser
+from _browser import UPLOAD_PAGES, find_upload, launch_browser, missing_upload_reason, open_page, watch_failures
 from _net import PROXY_HELP, curl_args, resolve_proxy
+from _streetview import fetch_meta, parse_meta
 
 SERVICES = {
-    "Baidu image search": "https://graph.baidu.com/pcpage/index?tpl_from=pc",
     "Baidu panoramas": "https://mapsv0.bdimg.com/?qt=qsdata&x=0&y=0",
     "Yandex Images": "https://yandex.com/images/",
     "Google satellite tiles": "https://mt1.google.com/vt/lyrs=s&x=0&y=0&z=0",
-    "Google Street View": "https://maps.googleapis.com/maps/api/js/GeoPhotoService.SingleImageSearch?pb=!1m5!1sapiv3!5sUS!11m2!1m1!1b0!2m4!1m2!3d35.6595!4d139.7005!2d50!3m10!2m2!1sen!2sUS!9m1!1e2!11m4!1m3!1e2!2b1!3e2!4m6!1e1!1e2!1e3!1e4!1e8!1e6&callback=cb",
     "Overpass": "https://overpass-api.de/api/status",
     "Elevation tiles": "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/0/0/0.png",
     "Hugging Face": "https://huggingface.co/",
@@ -65,6 +66,21 @@ def probe(item: tuple[str, str], proxy: str | None) -> dict:
         return check(name, "FAIL", "Probe could not complete within its time limit.", "Check curl and network access, then retry.")
 
 
+def streetview_check(proxy: str | None) -> dict:
+    """A real panorama lookup (Times Square, always covered): reachability alone hid a dead endpoint before."""
+    name = "Google Street View"
+    try:
+        raw = fetch_meta(40.7580, -73.9855, 50, proxy, timeout=12)
+    except (OSError, subprocess.TimeoutExpired):
+        return check(name, "FAIL", "Lookup could not complete within its time limit.", "Check curl and network access, then retry.")
+    res = parse_meta(raw)
+    if res:
+        return check(name, "PASS", f"Panorama lookup works (Times Square: {res['id']}, {res.get('date') or 'date unknown'}).")
+    hint = raw.strip()[:120] or "empty response"
+    return check(name, "FAIL", f"Panorama lookup returned no panorama: {hint}",
+                 "The endpoint may have changed or be blocked; see _streetview.py. Street View steps will return nothing until fixed.")
+
+
 async def browser_check(proxy: str | None) -> dict:
     try:
         from playwright.async_api import async_playwright
@@ -79,6 +95,33 @@ async def browser_check(proxy: str | None) -> dict:
     except Exception as exc:
         return check("Reverse-search browser", "WARN", str(exc),
                      "Install Chrome or run `uvx playwright install chromium`. Until then, use intake.py --no-rev.")
+
+
+async def upload_check(engine: str, proxy: str | None) -> dict:
+    """Open the engine's upload page and look for the upload control, as revimg.py does (no image is uploaded)."""
+    name = f"{engine.capitalize()} reverse-search upload"
+    url, buttons = UPLOAD_PAGES[engine]
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser, _ = await launch_browser(p, proxy)
+            try:
+                page = await browser.new_page()
+                failed = watch_failures(page)
+                err = await open_page(page, url, timeout=30000)
+                if err:
+                    return check(name, "FAIL", err, "Check network access to the host; this is not a page redesign.")
+                await page.wait_for_timeout(2000)
+                kind, _ = await find_upload(page, buttons, timeout_ms=2500)
+                if kind:
+                    return check(name, "PASS", f"Upload control found ({kind}).")
+                why = await missing_upload_reason(page, failed, engine.capitalize())
+                return check(name, "FAIL", why, "Follow the reason above; reverse search with this engine will fail until it is fixed.")
+            finally:
+                await browser.close()
+    except Exception as exc:  # noqa: BLE001
+        return check(name, "WARN", f"Could not run the upload check: {str(exc).splitlines()[0][:160]}",
+                     "Fix the reverse-search browser first (see that check).")
 
 
 def diagnose(network: bool, proxy: str | None) -> dict:
@@ -118,6 +161,9 @@ def diagnose(network: bool, proxy: str | None) -> dict:
     if network and shutil.which("curl"):
         with ThreadPoolExecutor(max_workers=8) as pool:
             rows.extend(pool.map(lambda item: probe(item, proxy), SERVICES.items()))
+        rows.append(streetview_check(proxy))
+        for engine in ("baidu", "yandex"):
+            rows.append(asyncio.run(upload_check(engine, proxy)))
     else:
         rows.append(check("Network probes", "SKIP", "Run with --network to check service reachability."))
     return {"ok": not any(row["status"] == "FAIL" for row in rows), "connection": route, "checks": rows}

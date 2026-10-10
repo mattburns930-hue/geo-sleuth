@@ -34,7 +34,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
-from _browser import launch_browser
+from _browser import UPLOAD_PAGES, find_upload, launch_browser, missing_upload_reason, open_page, upload_file, watch_failures
 from _net import fetch_bytes, PROXY_HELP
 import asyncio
 import io
@@ -53,6 +53,10 @@ BAIDU_REFUSED = ("功能优化中", "建议您重新上传其他图片")
 TEXT_URL = {"bing": "https://cn.bing.com/search?q={q}", "baiduimg": "https://image.baidu.com/search/index?tn=baiduimage&word={q}",
             "sogouimg": "https://pic.sogou.com/pics?query={q}"}
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+
+
+BAIDU_URL, BAIDU_UPLOAD_BUTTONS = UPLOAD_PAGES["baidu"]
+YANDEX_URL, YANDEX_UPLOAD_BUTTONS = UPLOAD_PAGES["yandex"]
 
 
 async def _collect(page, engine: str) -> dict:
@@ -145,13 +149,19 @@ async def _baidu(ctx, img: Path, shot: Path, similar_pages: int = 2, sheet_n: in
 
     pending: list = []
     page.on("response", lambda r: pending.append(asyncio.ensure_future(grab(r))) if "graph.baidu.com/ajax/pcsimi" in r.url else None)
-    await page.goto("https://graph.baidu.com/pcpage/index?tpl_from=pc", wait_until="domcontentloaded", timeout=60000)
+    failed = watch_failures(page)
+    err = await open_page(page, BAIDU_URL)
+    if err:
+        await page.close()
+        return {"error": err}
     await page.wait_for_timeout(2000)
-    inp = await page.query_selector("input[type=file]")
-    if not inp:
+    kind, handle = await find_upload(page, BAIDU_UPLOAD_BUTTONS)
+    if not kind:
         await page.screenshot(path=str(shot))
-        return {"error": "upload input not found (page redesigned or blocked); check the screenshot"}
-    await inp.set_input_files(str(img))
+        why = await missing_upload_reason(page, failed, "Baidu")
+        await page.close()
+        return {"error": f"{why}; check the screenshot"}
+    await upload_file(kind, handle, str(img))
     for _ in range(60):
         await page.wait_for_timeout(500)
         if "graph.baidu.com/s" in page.url:
@@ -192,13 +202,19 @@ async def _baidu(ctx, img: Path, shot: Path, similar_pages: int = 2, sheet_n: in
 
 async def _yandex(ctx, img: Path, shot: Path) -> dict:
     page = await ctx.new_page()
-    await page.goto("https://yandex.com/images/search?rpt=imageview", wait_until="domcontentloaded", timeout=60000)
+    failed = watch_failures(page)
+    err = await open_page(page, YANDEX_URL)
+    if err:
+        await page.close()
+        return {"error": err}
     await page.wait_for_timeout(2500)
-    inp = await page.query_selector("input[type=file]")
-    if not inp:
+    kind, handle = await find_upload(page, YANDEX_UPLOAD_BUTTONS)
+    if not kind:
         await page.screenshot(path=str(shot))
-        return {"error": "upload input not found (possibly asked for verification); check the screenshot"}
-    await inp.set_input_files(str(img))
+        why = await missing_upload_reason(page, failed, "Yandex")
+        await page.close()
+        return {"error": f"{why}; check the screenshot"}
+    await upload_file(kind, handle, str(img))
     for _ in range(60):
         await page.wait_for_timeout(500)
         if "url=" in page.url or "cbir_id" in page.url:
