@@ -30,7 +30,7 @@ By default, estimate phone photos as taken with the main camera, 35mm-equivalent
 | 5x | ≈14–16° | ≈8–9° |
 
 When you can't tell the zoom, don't guess a single value: `geo.py range --real <object size> --pixels <pixels> --image-width <width> --hfov 8:70` gives the whole distance range; search for candidates over that range. Then use section 11 to check whether "landmark X is not in the frame" can exclude anything.
-**Fit the lens instead of assuming it** (section 12): `geo.py fitcam` scores every phone lens from 0.5x to 5x at once. Most photos are 1x, so 1x is the working assumption, but a geometry check run at one lens only tests that lens.
+**Fit the zoom instead of assuming it** (section 12): `geo.py fitcam` scores the phone lens steps and then fits the zoom continuously. **Zoom can be any value**: digital zoom, pinch-to-zoom and cropping give 1.6x, 2.7x and so on, so never round to the nearest lens. An object of known size is a second, independent handle on zoom × distance (Beacon Crag, Porthleven: a house ~95 px wide plus the angle to a distant headland fixed both the camera spot and a ~2.8x zoom). Most photos are 1x, so 1x is the working assumption, but a geometry check run at one lens only tests that lens.
 The zoom can be backed out: identify two or more landmarks with known positions; the angle spanned by their horizontal pixel spacing in the frame can be computed from the candidate camera position; comparing the two gives the focal length (with 4 or more points, use `pose.py` from section 10 directly, with hfov not fixed).
 
 Focal length (pixels): `f = (image width in px / 2) / tan(FOV / 2)`
@@ -291,7 +291,7 @@ uv run scripts/geo.py fitcam --width 1200 --height 1600 --center <lat,lon> --rad
     --feat left_end:20:<lat,lon> --feat lamp:420:<lat,lon> --out fit.json
 ```
 
-- Every lens in `PHONE_LENSES` (0.5x, 1x 24/26 mm, 2x, 3x, 5x) is scored; focal length in pixels follows the image's aspect ratio (a 4:3 frame cropped to the image), so 9:16 stories and 16:9 crops are handled. Heading is solved at every grid position.
+- Every lens step in `PHONE_LENSES` (0.5x, 1x 24/26 mm, 2x, 3x, 5x) is scored, then the zoom is swept continuously (≈0.45x–12x, refined to ~0.5%) over the best positions and reported as a `fitted N.NNx` row; `zoom` is the 35mm-equivalent focal length ÷ 24 mm (so the "3x" 77 mm lens is 3.2x). When the fitted zoom lands within 6% of a lens step, the verdict treats it as that lens; otherwise use the fitted value. Focal length in pixels follows the image's aspect ratio (a 4:3 frame cropped to the image), so 9:16 stories and 16:9 crops are handled. Heading is solved at every grid position.
 - The score is the **pixel** RMS of the column residuals. Scoring in degrees favours telephoto lenses, because every angle shrinks as the focal length grows: in a test, a degree score picked 5x with the camera 98 m from the truth.
 - `a|b` gives a feature alternative map identities; the fit picks the best one per position and reports which. Use it whenever you aren't sure which building is which: a wrong identity was the root failure in the Queen's Parade case.
 - **Use ≥5 features spread across the frame and at different distances.** With 3–4, a distant camera with a long lens can fit by trading position against focal length. In synthetic tests with 5 well-spread features and 4 px noise, the true lens and position (0 m error) were recovered for 1x, 0.5x and 2x.

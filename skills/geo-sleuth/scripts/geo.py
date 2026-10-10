@@ -278,8 +278,11 @@ def _wrap(a: float) -> float:
 def fit_camera(feats: list[tuple[str, float, list[tuple[float, float]]]], width: float, height: float,
                center: tuple[float, float], radius: float, grid: float,
                lenses: list[tuple[str, float]] | None = None, cx: float | None = None,
-               min_dist: float = 3.0, band_px: float = 10.0) -> list[dict]:
+               min_dist: float = 3.0, band_px: float = 10.0, continuous: bool = True) -> list[dict]:
     """Fit camera position + heading from photo columns of known map points, for each candidate lens.
+
+    Zoom is not limited to the phone's lens steps (digital zoom, pinch-to-zoom and crops give any value), so
+    after scoring the common lenses it sweeps the zoom continuously (≈0.45x–12x) and adds a "fitted N.NNx" row.
 
     feats: (name, pixel column x, [(lat, lon), …alternative identities]). Heading is solved per position;
     score = RMS of column residuals in pixels (comparable across lenses). With a free position, a wider lens can often be traded for a closer
@@ -298,15 +301,17 @@ def fit_camera(feats: list[tuple[str, float, list[tuple[float, float]]]], width:
         for j in range(-n, n + 1):
             if (i * grid) ** 2 + (j * grid) ** 2 <= radius ** 2:
                 cams.append(_ll((i * grid, j * grid), center))
-    out = []
-    for lname, mm in lenses:
-        f = lens_focal_px(mm, width, height)
+    # bearings depend only on the camera position: compute once, reuse for every focal length
+    brgs = {cam: [[None if distance(cam, p) < min_dist else bearing(cam, p) for p in alts] for _, _, alts in feats]
+            for cam in cams}
+
+    def score(f: float, cam_list) -> tuple[tuple | None, list]:
         offs = [math.degrees(math.atan((x - cx) / f)) for _, x, _ in feats]
-        best, near_best = None, []
-        for cam in cams:
-            brg = [[None if distance(cam, p) < min_dist else bearing(cam, p) for p in alts] for _, _, alts in feats]
+        best, per_cam = None, []
+        for cam in cam_list:
+            cam_best = None
             for combo in combos:
-                bs = [brg[k][c] for k, c in enumerate(combo)]
+                bs = [brgs[cam][k][c] for k, c in enumerate(combo)]
                 if any(b is None for b in bs):
                     continue
                 d = [math.radians(b - o) for b, o in zip(bs, offs)]
@@ -318,42 +323,85 @@ def fit_camera(feats: list[tuple[str, float, list[tuple[float, float]]]], width:
                     a = _wrap(b - H)
                     res.append((cx + f * math.tan(math.radians(a)) - x) if abs(a) < 89 else 1e4)
                 rms = math.sqrt(sum(r * r for r in res) / len(res))
-                row = (rms, cam, H, res, combo)
-                if best is None or rms < best[0]:
-                    best = row
-                near_best.append((rms, cam))
+                if cam_best is None or rms < cam_best[0]:
+                    cam_best = (rms, cam, H, res, combo)
+            if cam_best:
+                per_cam.append((cam_best[0], cam))
+                if best is None or cam_best[0] < best[0]:
+                    best = cam_best
+        return best, per_cam
+
+    def row(name: str, mm: float, f: float, best: tuple, per_cam: list, continuous: bool = False) -> dict:
+        band = [c for r, c in per_cam if r <= best[0] + band_px]
+        spread = max((distance(best[1], c) for c in band), default=0.0)
+        return {"lens": name, "equiv_mm": round(mm, 1), "zoom": round(mm / 24.0, 2), "continuous": continuous,
+                "focal_px": round(f, 1), "hfov_deg": round(2 * math.degrees(math.atan(width / 2 / f)), 1),
+                "rms_px": round(best[0], 1), "cam": [round(best[1][0], 6), round(best[1][1], 6)],
+                "heading": round(best[2], 1),
+                "residuals": {feats[k][0]: round(r, 2) for k, r in enumerate(best[3])},
+                "identities": {feats[k][0]: best[4][k] for k in range(len(feats)) if len(feats[k][2]) > 1},
+                "band_m": round(spread), "band_n": len(band)}
+
+    out, shortlist = [], set()
+    for lname, mm in lenses:
+        f = lens_focal_px(mm, width, height)
+        best, per_cam = score(f, cams)
         if best is None:
             continue
-        band = [c for r, c in near_best if r <= best[0] + band_px]
-        spread = max((distance(best[1], c) for c in band), default=0.0)
-        out.append({"lens": lname, "equiv_mm": mm, "focal_px": round(f, 1),
-                    "hfov_deg": round(2 * math.degrees(math.atan(width / 2 / f)), 1),
-                    "rms_px": round(best[0], 1), "cam": [round(best[1][0], 6), round(best[1][1], 6)],
-                    "heading": round(best[2], 1),
-                    "residuals": {feats[k][0]: round(r, 2) for k, r in enumerate(best[3])},
-                    "identities": {feats[k][0]: best[4][k] for k in range(len(feats)) if len(feats[k][2]) > 1},
-                    "band_m": round(spread), "band_n": len(band)})
+        out.append(row(lname, mm, f, best, per_cam))
+        shortlist.update(c for _, c in sorted(per_cam)[:150])
+    # zoom is continuous (digital zoom, pinch, crops): sweep it on the positions the lens pass found promising
+    if continuous and shortlist:
+        mm, best_c = None, None
+        k = 0
+        while 10.8 * 1.03 ** k <= 290:  # ≈0.45x … 12x in 3% steps
+            m = 10.8 * 1.03 ** k
+            b, _ = score(lens_focal_px(m, width, height), shortlist)
+            if b and (best_c is None or b[0] < best_c[0]):
+                mm, best_c = m, b
+            k += 1
+        if mm:
+            for m in [mm * (1 + 0.005 * i) for i in range(-6, 7)]:  # refine to ~0.5%
+                b, _ = score(lens_focal_px(m, width, height), shortlist)
+                if b and b[0] < best_c[0]:
+                    mm, best_c = m, b
+            f = lens_focal_px(mm, width, height)
+            b, per_cam = score(f, cams)
+            out.append(row(f"fitted {mm / 24.0:.2f}x", mm, f, b, per_cam, continuous=True))
     out.sort(key=lambda r: r["rms_px"])
     return out
 
 
 def lens_verdict(fits: list[dict], tie_ratio: float = 1.5) -> str:
-    """1x is the working assumption unless another lens fits clearly better."""
+    """1x is the working assumption unless another zoom fits clearly better. Zoom can be any value, not just lens steps."""
     if not fits:
         return "no fit"
     best = fits[0]
-    one = next((r for r in fits if r["lens"].startswith("1x")), None)
-    if best["lens"].startswith("1x"):
-        others = [r for r in fits if not r["lens"].startswith("1x") and r["rms_px"] <= best["rms_px"] * tie_ratio]
+    fitted = next((r for r in fits if r.get("continuous")), None)
+    steps = [r for r in fits if not r.get("continuous")]
+    one = next((r for r in steps if r["lens"].startswith("1x")), None)
+    note = ""
+    if fitted:
+        near = min(steps, key=lambda r: abs(math.log(r["equiv_mm"] / fitted["equiv_mm"])), default=None)
+        if near and abs(near["equiv_mm"] / fitted["equiv_mm"] - 1) <= 0.06:
+            note = f" Best continuous zoom {fitted['zoom']:.2f}x ≈ the {near['lens']} lens."
+            fits = [near if r is fitted else r for r in fits if r is not near]  # same answer: judge it as that lens
+            best = fits[0]
+        else:
+            note = (f" Best continuous zoom {fitted['zoom']:.2f}x (rms {fitted['rms_px']} px) is between lens steps: "
+                    "digital/pinch zoom or a crop is likely; use the fitted value, not the nearest lens.")
+    if one and best is not one and best["rms_px"] * tie_ratio >= one["rms_px"]:
+        return (f"{best['lens']} and 1x fit about equally (rms {best['rms_px']} px vs {one['rms_px']} px): zoom unresolved; "
+                "most phone photos are 1x, so keep both camera positions as candidates." + note)
+    if best is one:
+        others = [r for r in fits if r is not one and r["rms_px"] <= best["rms_px"] * tie_ratio]
         if others:
             return (f"1x fits best, but {others[0]['lens']} is close (rms {others[0]['rms_px']} px vs {best['rms_px']} px): "
-                    "lens unresolved; keep 1x as the working assumption and keep both camera positions as candidates")
-        return f"1x fits best (rms {best['rms_px']} px)"
-    if one and one["rms_px"] <= best["rms_px"] * tie_ratio:
-        return (f"{best['lens']} and 1x fit about equally (rms {best['rms_px']} px vs {one['rms_px']} px): lens unresolved; "
-                "most phone photos are 1x, so keep both camera positions as candidates")
+                    "zoom unresolved; keep 1x as the working assumption and keep both camera positions as candidates." + note)
+        return f"1x fits best (rms {best['rms_px']} px)." + note
+    zoom = f"{best['zoom']:.2f}x" if best.get("continuous") else best["lens"]
     return (f"{best['lens']} fits clearly better than 1x (rms {best['rms_px']} px vs {one['rms_px'] if one else '?'} px): "
-            f"record it with `board.py assume lens={best['lens']}` and re-check anything ruled out under lens=1x")
+            f"record it with `board.py assume lens={zoom}` and re-check anything ruled out under lens=1x." + note)
 
 
 # ---------------------------------------------------------------- sight-line intersection
@@ -853,7 +901,7 @@ def main() -> None:
     ln.add_argument("--step", type=float, default=100)
     ln.add_argument("--out", help="write {name:[lat,lon]}, can be passed to tiles.py mark")
 
-    fc = sub.add_parser("fitcam", help="camera position + heading from photo columns of known map points, fitted for every phone lens (0.5x–5x); never assumes the lens",
+    fc = sub.add_parser("fitcam", help="camera position + heading from photo columns of known map points; scores the phone lens steps and fits the zoom continuously (any value, e.g. 2.7x); never assumes the lens",
                         formatter_class=argparse.RawDescriptionHelpFormatter,
                         epilog="Example:\n"
                                "  geo.py fitcam --width 1200 --height 1600 --center <lat,lon> --radius 150 --grid 3 \\\n"
@@ -869,6 +917,7 @@ def main() -> None:
     fc.add_argument("--radius", type=float, default=150, help="search radius m")
     fc.add_argument("--grid", type=float, default=5, help="grid step m")
     fc.add_argument("--lenses", help="override, e.g. 0.5x:13,1x:24,2x:48 (default 0.5x,1x,1x-26mm,2x,3x,5x)")
+    fc.add_argument("--steps-only", action="store_true", help="only score the lens steps; skip the continuous zoom sweep")
     fc.add_argument("--cx", type=float, help="principal point column (default image centre)")
     fc.add_argument("--out", help="write the fits as JSON")
 
@@ -1167,12 +1216,13 @@ def main() -> None:
         if args.lenses:
             lenses = [(a.split(":")[0], float(a.split(":")[1])) for a in args.lenses.split(",")]
         try:
-            fits = fit_camera(feats, args.width, args.height, args.center, args.radius, args.grid, lenses, args.cx)
+            fits = fit_camera(feats, args.width, args.height, args.center, args.radius, args.grid, lenses, args.cx,
+                              continuous=not args.steps_only)
         except ValueError as e:
             ap.error(str(e))
-        print(f"{'lens':8s} {'f_px':>6s} {'hfov':>5s} {'rms px':>6s}  camera               heading  band")
+        print(f"{'zoom':13s} {'f_px':>6s} {'hfov':>5s} {'rms px':>6s}  camera               heading  band")
         for r in fits:
-            print(f"{r['lens']:8s} {r['focal_px']:6.0f} {r['hfov_deg']:5.1f} {r['rms_px']:6.1f}  "
+            print(f"{r['lens']:13s} {r['focal_px']:6.0f} {r['hfov_deg']:5.1f} {r['rms_px']:6.1f}  "
                   f"{r['cam'][0]:.6f},{r['cam'][1]:.6f} {r['heading']:6.1f}  {r['band_m']:4d} m")
             print("         residuals px " + ", ".join(f"{k} {v:+.0f}" for k, v in r["residuals"].items())
                   + ("; identities " + ", ".join(f"{k}=#{v}" for k, v in r["identities"].items()) if r["identities"] else ""))

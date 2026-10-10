@@ -185,13 +185,13 @@ class LensFitTests(unittest.TestCase):
 
     def test_recovers_lens_and_position(self):
         for lens, mm in (("1x", 24.0), ("0.5x", 13.0), ("2x", 48.0)):
-            fits = geo.fit_camera(self._feats(mm), self.W, self.H, self.CAM, 100, 5)
+            fits = geo.fit_camera(self._feats(mm), self.W, self.H, self.CAM, 100, 5, continuous=False)
             self.assertEqual(fits[0]["lens"], lens)
             self.assertLess(geo.distance(tuple(fits[0]["cam"]), self.CAM), 10)
             self.assertAlmostEqual(fits[0]["heading"], 55.0, delta=1.5)
 
     def test_pixel_score_does_not_favour_telephoto(self):
-        fits = geo.fit_camera(self._feats(24.0), self.W, self.H, self.CAM, 100, 5)
+        fits = geo.fit_camera(self._feats(24.0), self.W, self.H, self.CAM, 100, 5, continuous=False)
         tele = next(r for r in fits if r["lens"] == "5x")
         self.assertGreater(tele["rms_px"], 5 * fits[0]["rms_px"])
 
@@ -200,14 +200,24 @@ class LensFitTests(unittest.TestCase):
         wrong = geo.dest(self.CAM, 0, 200)
         name, x, alts = feats[2]
         feats[2] = (name, x, [wrong, alts[0]])
-        best = geo.fit_camera(feats, self.W, self.H, self.CAM, 100, 5)[0]
+        best = geo.fit_camera(feats, self.W, self.H, self.CAM, 100, 5, continuous=False)[0]
         self.assertEqual(best["identities"][name], 1)
 
     def test_verdict_prefers_1x_unless_clearly_beaten(self):
-        mk = lambda lens, rms: {"lens": lens, "rms_px": rms}  # noqa: E731
-        self.assertIn("1x fits best", geo.lens_verdict([mk("1x", 4), mk("0.5x", 40)]))
-        self.assertIn("unresolved", geo.lens_verdict([mk("0.5x", 5), mk("1x", 6)]))
-        self.assertIn("clearly better", geo.lens_verdict([mk("0.5x", 3), mk("1x", 50)]))
+        mk = lambda lens, mm, rms, c=False: {"lens": lens, "equiv_mm": mm, "zoom": mm / 24, "rms_px": rms, "continuous": c}  # noqa: E731
+        self.assertIn("1x fits best", geo.lens_verdict([mk("1x", 24, 4), mk("0.5x", 13, 40)]))
+        self.assertIn("unresolved", geo.lens_verdict([mk("0.5x", 13, 5), mk("1x", 24, 6)]))
+        self.assertIn("clearly better", geo.lens_verdict([mk("0.5x", 13, 3), mk("1x", 24, 50)]))
+        # a fitted zoom that lands on a lens step is that lens, not a rival to it
+        self.assertTrue(geo.lens_verdict([mk("fitted 1.00x", 24.1, 2.8, True), mk("1x", 24, 2.9)]).startswith("1x fits best"))
+        self.assertIn("between lens steps", geo.lens_verdict([mk("fitted 2.69x", 64.6, 2.8, True), mk("3x", 77, 23), mk("1x", 24, 110)]))
+
+    def test_zoom_is_fitted_between_lens_steps(self):
+        for mm in (64.8, 38.4):  # 2.7x and 1.6x: digital zoom / crops, not a phone lens
+            best = geo.fit_camera(self._feats(mm), self.W, self.H, self.CAM, 100, 5)[0]
+            self.assertTrue(best["continuous"], best["lens"])
+            self.assertAlmostEqual(best["equiv_mm"], mm, delta=mm * 0.03)
+            self.assertLess(geo.distance(tuple(best["cam"]), self.CAM), 10)
 
     def test_needs_three_features(self):
         with self.assertRaises(ValueError):
